@@ -896,7 +896,8 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         rollout_full_prompt_and_completion_parallelized_curriculum.env_pool = env_pool
         rollout_full_prompt_and_completion_parallelized_curriculum.num_servers = len(env_pool)
         rollout_full_prompt_and_completion_parallelized_curriculum.initialized = True
-        rollout_full_prompt_and_completion_parallelized_curriculum.thread_pool = ThreadPoolExecutor(max_workers=len(env_pool))
+        # Allow many threads for env interactions; semaphore gates model generation
+        rollout_full_prompt_and_completion_parallelized_curriculum.thread_pool = ThreadPoolExecutor(max_workers=max(16, len(env_pool)))
         rollout_full_prompt_and_completion_parallelized_curriculum.generation_semaphore = Semaphore(1)
         rollout_full_prompt_and_completion_parallelized_curriculum.games_to_task_id_range = games_to_task_id_range
         rollout_full_prompt_and_completion_parallelized_curriculum.selected_game = selected_game
@@ -977,16 +978,19 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
 
         # --- Build Conversation History ---
         system_prompt = GIN_RUMMY_SYSTEM_PROMPT
-
-        if use_hints:
-            system_prompt += GIN_RUMMY_HINT
-
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": formatted_observation}]
+        messages = [{"role": "system", "content": system_prompt}]
 
         # --- Interaction Loop ---
         while not done and (turn_number < current_max_turn):
             # Compute optimal action for this observation
             expected_optimal = compute_optimal_action(formatted_observation)
+
+            # When hints enabled, append the optimal action directly to the observation
+            obs_with_hint = formatted_observation
+            if use_hints and expected_optimal is not None:
+                obs_with_hint = formatted_observation + f"\n\n[HINT: The best action here is {expected_optimal}]"
+
+            messages.append({"role": "user", "content": obs_with_hint})
 
             # Generate Rollout Completion
             with rollout_full_prompt_and_completion_parallelized_curriculum.generation_semaphore:
@@ -1088,8 +1092,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
 
             if done:
                 train_reward = step_reward
-            else:
-                messages.append({"role": "user", "content": formatted_observation})
+            # Next observation will be added at the top of the loop with hint
 
             turn_number += 1
 
