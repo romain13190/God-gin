@@ -806,7 +806,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
 
 
 # ============================================================
-# Rollout Function 3: Full episode with strategy tracking
+# Rollout Function 3: Lockstep batched multi-turn rollout
 # ============================================================
 def rollout_full_prompt_and_completion_parallelized_curriculum(
     prompts: list[str],
@@ -814,14 +814,16 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
     max_turns: int = 30,
 ) -> dict[str, list]:
     """
-    Parallelized rollout function for Gin Rummy.
-    Uses full prompt and completion IDs with action masking.
+    Lockstep batched rollout for Gin Rummy with curriculum learning.
+    - All episodes advance turn-by-turn in sync
+    - Generations are batched into a SINGLE vLLM call per turn (no Semaphore)
+    - Env HTTP calls are parallelized via ThreadPoolExecutor
+    - Action masking: 1 for model-generated tokens, 0 for env/user tokens
+    - Teacher/student hint split with curriculum fade-out
     """
-    # --- Constants for context length management ---
+    # --- Constants ---
     MAX_EPISODE_TOKENS = 16384
     MAX_PROMPT_LEN = 4225
-
-    # --- Reward Shaping Parameters ---
     STRATEGY_REWARD_WEIGHT = 0.5
     STEP_STRATEGY_REWARD = 0.1
 
@@ -837,9 +839,10 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
     }
 
     selected_game = "gin_rummy"
+    fn = rollout_full_prompt_and_completion_parallelized_curriculum
 
-    # --- 1. Static Initialization (Once per Rank) ---
-    if not getattr(rollout_full_prompt_and_completion_parallelized_curriculum, "initialized", False):
+    # --- Static Initialization (Once per Rank) ---
+    if not getattr(fn, "initialized", False):
         rank = int(os.environ.get("LOCAL_RANK", "0"))
         raw_urls = os.environ.get("ENVIRONMENT_SERVER_URLS", "")
         server_urls = [u.strip() for u in raw_urls.split(",") if u.strip()]
@@ -848,7 +851,6 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
             raise RuntimeError("ENVIRONMENT_SERVER_URLS is empty")
 
         env_pool = []
-
         for idx, base_url in enumerate(server_urls):
             try:
                 print(f"[INIT] Initializing env on server {idx}: {base_url}")
@@ -860,22 +862,13 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
             except Exception as e:
                 raise RuntimeError(f"Failed to init server {base_url}: {e}")
 
-        rollout_full_prompt_and_completion_parallelized_curriculum.rank = rank
-        rollout_full_prompt_and_completion_parallelized_curriculum.env_pool = env_pool
-        rollout_full_prompt_and_completion_parallelized_curriculum.num_servers = len(env_pool)
-        rollout_full_prompt_and_completion_parallelized_curriculum.initialized = True
-        # Allow many threads for env interactions; semaphore gates model generation
-        rollout_full_prompt_and_completion_parallelized_curriculum.thread_pool = ThreadPoolExecutor(max_workers=max(16, len(env_pool)))
-        rollout_full_prompt_and_completion_parallelized_curriculum.generation_semaphore = Semaphore(1)
-        rollout_full_prompt_and_completion_parallelized_curriculum.games_to_task_id_range = games_to_task_id_range
-        rollout_full_prompt_and_completion_parallelized_curriculum.selected_game = selected_game
+        fn.rank = rank
+        fn.env_pool = env_pool
+        fn.num_servers = len(env_pool)
+        fn.initialized = True
+        fn.thread_pool = ThreadPoolExecutor(max_workers=max(16, len(env_pool)))
 
-        # Initialize curriculum scheduler
-        # Target: reach max_turn=30 within ~1h (first third of 3h training)
-        # With 16 rollouts/batch, ~180 batches/h → ~2880 rollouts/h
-        # rollouts_per_stage=96, +2 turns/stage → 14 stages to reach 30
-        # 14 stages × 96 = 1344 rollouts + 96 warmup ≈ 1440 rollouts ≈ 90 batches ≈ 30min
-        rollout_full_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
+        fn.curriculum = CurriculumScheduler(
             initial_max_turn=trainer.args.initial_max_turn,
             final_max_turn=30,
             rollouts_per_stage=96,
@@ -883,239 +876,222 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
             final_hint_prob=0.0,
             warmup_rollouts=96,
         )
-        print(f"[CURRICULUM] Initialized with initial_max_turn={trainer.args.initial_max_turn}, final_max_turn=30, rollouts_per_stage=96, warmup=96")
+        print(f"[CURRICULUM] init max_turn={trainer.args.initial_max_turn}->30, stage=96, hint=0.75->0.0")
 
     # Retrieve static variables
-    rank = rollout_full_prompt_and_completion_parallelized_curriculum.rank
-    env_pool = rollout_full_prompt_and_completion_parallelized_curriculum.env_pool
-    num_servers = rollout_full_prompt_and_completion_parallelized_curriculum.num_servers
-    games_to_task_id_range = rollout_full_prompt_and_completion_parallelized_curriculum.games_to_task_id_range
-    selected_game = rollout_full_prompt_and_completion_parallelized_curriculum.selected_game
-    curriculum = rollout_full_prompt_and_completion_parallelized_curriculum.curriculum
+    rank = fn.rank
+    env_pool = fn.env_pool
+    num_servers = fn.num_servers
+    curriculum = fn.curriculum
+    thread_pool = fn.thread_pool
 
     tokenizer = trainer.processing_class
     TIMEOUT = 2400
+    num_episodes = len(prompts)
 
-    # Get current curriculum parameters
-    total_rollouts = curriculum.total_rollouts
+    # Get curriculum params
     current_max_turn = curriculum.get_max_turn()
     current_hint_prob = curriculum.get_hint_prob()
-    print(f"[CURRICULUM] Rollout {total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
+    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
 
-    def run_single_prompt(index: int, prompt: str):
-        game_id = int(prompt)
+    # ========================================
+    # Phase 1: Reset all environments in parallel
+    # ========================================
+    episodes = [None] * num_episodes
 
+    def reset_env(index):
+        game_id = int(prompts[index])
         server_idx = (index + rank) % num_servers
-        server = env_pool[server_idx]
-        env_endpoint = server["base_url"]
-
-        episode_prompt_ids: list[int] = []
-        episode_completion_ids: list[int] = []
-        episode_logprobs: list[float] = []
-        episode_action_mask: list[int] = []
-        prev_full_ids: list[int] | None = None
-        invalid_count = 0
-        done = False
-        train_reward = 0.0
-        turn_number = 0
-
-        # Track strategy adherence
-        strategy_followed_count = 0
-        total_strategy_opportunities = 0
-        step_rewards = []
-        # Determine if this episode gets hints
-        use_hints = random.random() < current_hint_prob
-
-        # --- Reset Environment (POST /reset) ---
+        env_endpoint = env_pool[server_idx]["base_url"]
         payload = {"task_id": game_id, "seed": 42, "opponent": "mcts"}
-
         try:
-            reset_res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=TIMEOUT)
-            reset_res.raise_for_status()
-            reset_data = reset_res.json()
-            result_block = reset_data["result"]
-
-            episode_id = result_block.get("episode_id", "")
-
-            raw_observation = result_block.get("observation", "")
-            formatted_observation = format_observation(raw_observation)
-
+            res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=TIMEOUT)
+            res.raise_for_status()
+            result = res.json()["result"]
+            return index, {
+                "game_id": game_id,
+                "episode_id": result.get("episode_id", ""),
+                "observation": format_observation(result.get("observation", "")),
+                "env_endpoint": env_endpoint,
+            }
         except Exception as e:
-            print(f"Failed to reset environment (Game {game_id}): {e}")
+            print(f"Reset failed for game {game_id}: {e}")
             return index, None
 
-        # --- Build Conversation History ---
-        system_prompt = GIN_RUMMY_SYSTEM_PROMPT
-        messages = [{"role": "system", "content": system_prompt}]
+    reset_futures = [thread_pool.submit(reset_env, i) for i in range(num_episodes)]
+    for f in as_completed(reset_futures):
+        idx, data = f.result()
+        episodes[idx] = data
 
-        # --- Interaction Loop ---
-        while not done and (turn_number < current_max_turn):
-            # Compute optimal action for this observation
-            expected_optimal = compute_optimal_action(formatted_observation)
+    # Initialize per-episode state
+    for i in range(num_episodes):
+        if episodes[i] is None:
+            episodes[i] = {
+                "game_id": int(prompts[i]),
+                "episode_id": "",
+                "observation": "",
+                "env_endpoint": "",
+            }
+            episodes[i]["_failed"] = True
+        else:
+            episodes[i]["_failed"] = False
 
-            # When hints enabled, append the optimal action directly to the observation
-            obs_with_hint = formatted_observation
-            if use_hints and expected_optimal is not None:
-                obs_with_hint = formatted_observation + f"\n\n[HINT: The best action here is {expected_optimal}]"
+        ep = episodes[i]
+        ep["messages"] = [{"role": "system", "content": GIN_RUMMY_SYSTEM_PROMPT}]
+        ep["prompt_ids_first"] = []
+        ep["completion_ids"] = []
+        ep["logprobs"] = []
+        ep["action_mask"] = []
+        ep["prev_full_ids"] = None
+        ep["done"] = ep.get("_failed", False)
+        ep["active"] = not ep.get("_failed", False)
+        ep["strategy_count"] = 0
+        ep["strategy_total"] = 0
+        ep["step_rewards"] = []
+        ep["invalid_count"] = 0
+        ep["train_reward"] = 0.0
 
-            messages.append({"role": "user", "content": obs_with_hint})
+        # Teacher/student hint split
+        is_teacher = (i % 2 == 0)
+        ep["is_teacher"] = is_teacher
+        ep["use_hints"] = is_teacher and (random.random() < current_hint_prob)
 
-            # Generate Rollout Completion
-            with rollout_full_prompt_and_completion_parallelized_curriculum.generation_semaphore:
-                rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
+    # ========================================
+    # Phase 2: Lockstep turn loop
+    # ========================================
+    for turn in range(current_max_turn):
+        active_indices = [i for i in range(num_episodes) if episodes[i]["active"] and not episodes[i]["done"]]
+        if not active_indices:
+            break
 
-            prompt_ids = rollout_outputs.get("prompt_ids", [])
-            completion_ids = rollout_outputs.get("completion_ids", [])
-            logprobs = rollout_outputs.get("logprobs", [])
+        # 2a. Prepare prompts: append observation + optional hint
+        for i in active_indices:
+            ep = episodes[i]
+            obs = ep["observation"]
+            expected_optimal = compute_optimal_action(obs)
+            ep["_expected_optimal"] = expected_optimal
+
+            obs_for_model = obs
+            if ep["use_hints"] and expected_optimal is not None:
+                obs_for_model = obs + f"\n\n[HINT: The best action here is {expected_optimal}]"
+            ep["messages"].append({"role": "user", "content": obs_for_model})
+
+        # 2b. Batched generation - SINGLE vLLM call for all active episodes
+        prompts_to_gen = [episodes[i]["messages"] for i in active_indices]
+        all_outputs = generate_rollout_completions(trainer, prompts=prompts_to_gen, as_chat=True)
+
+        # 2c. Process generation outputs: delta computation + action masking
+        for j, i in enumerate(active_indices):
+            ep = episodes[i]
+            output = all_outputs[j]
+
+            prompt_ids = output.get("prompt_ids", [])
+            completion_ids = output.get("completion_ids", [])
+            logprobs = output.get("logprobs", [])
             completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
 
-            # Check if prompt exceeds max length
+            # Check prompt length limit
             if len(prompt_ids) > MAX_PROMPT_LEN:
-                print(f"Warning: Prompt exceeded {MAX_PROMPT_LEN} tokens ({len(prompt_ids)}) at turn {turn_number}, ending episode early")
-                done = True
-                break
+                print(f"Prompt exceeded {MAX_PROMPT_LEN} at turn {turn}, ending episode {i}")
+                ep["active"] = False
+                continue
 
-            if turn_number == 0:
-                episode_prompt_ids = prompt_ids
-                prev_full_ids = prompt_ids.copy()
+            # Delta computation for action masking
+            if turn == 0:
+                ep["prompt_ids_first"] = prompt_ids
+                ep["prev_full_ids"] = prompt_ids.copy()
             else:
-                if prev_full_ids is None:
-                    prev_full_ids = prompt_ids.copy()
-                elif prompt_ids[: len(prev_full_ids)] != prev_full_ids:
-                    print(
-                        f"Warning: BPE mismatch at turn {turn_number} (expected prefix {len(prev_full_ids)}, "
-                        f"got {len(prompt_ids)} tokens). Skipping delta mask for this turn."
-                    )
-                    prev_full_ids = prompt_ids.copy()
+                prev = ep["prev_full_ids"]
+                if prev is None:
+                    ep["prev_full_ids"] = prompt_ids.copy()
+                elif len(prompt_ids) >= len(prev) and prompt_ids[:len(prev)] == prev:
+                    delta = prompt_ids[len(prev):]
+                    if delta:
+                        ep["completion_ids"].extend(delta)
+                        ep["logprobs"].extend([0.0] * len(delta))
+                        ep["action_mask"].extend([0] * len(delta))
+                    ep["prev_full_ids"] = prompt_ids.copy()
                 else:
-                    delta_prompt_ids = prompt_ids[len(prev_full_ids):]
-                    if delta_prompt_ids:
-                        episode_completion_ids.extend(delta_prompt_ids)
-                        episode_logprobs.extend([0.0] * len(delta_prompt_ids))
-                        episode_action_mask.extend([0] * len(delta_prompt_ids))
-                    prev_full_ids = prompt_ids.copy()
+                    print(f"BPE mismatch at turn {turn}, episode {i}")
+                    ep["prev_full_ids"] = prompt_ids.copy()
 
             if completion_ids:
-                episode_completion_ids.extend(completion_ids)
-                episode_logprobs.extend(logprobs)
-                episode_action_mask.extend([1] * len(completion_ids))
-                if prev_full_ids is not None:
-                    prev_full_ids = prev_full_ids + completion_ids
-            messages.append({"role": "assistant", "content": completion_text})
+                ep["completion_ids"].extend(completion_ids)
+                ep["logprobs"].extend(logprobs)
+                ep["action_mask"].extend([1] * len(completion_ids))
+                if ep["prev_full_ids"] is not None:
+                    ep["prev_full_ids"] = ep["prev_full_ids"] + completion_ids
 
-            # --- Parse Action ---
-            action_to_send = remove_reasoning_tags(completion_text)
-            if action_to_send.endswith("</s>"):
-                action_to_send = action_to_send[:-4]
+            ep["messages"].append({"role": "assistant", "content": completion_text})
 
-            if "Action:" in action_to_send:
-                action_to_send = action_to_send.split("Action:")[-1].strip()
+            # Parse action
+            action_text = remove_reasoning_tags(completion_text)
+            if action_text.endswith("</s>"):
+                action_text = action_text[:-4]
+            if "Action:" in action_text:
+                action_text = action_text.split("Action:")[-1].strip()
+            numbers = re.findall(r'\b(\d+)\b', action_text)
+            if numbers:
+                action_text = numbers[-1]
+            ep["_parsed_action"] = action_text
 
-            # Robust number extraction: find last integer in the string
-            number_match = re.findall(r'\b(\d+)\b', action_to_send)
-            if number_match:
-                action_to_send = number_match[-1]
-
-            # --- Check Strategy Adherence ---
+            # Strategy adherence check
             try:
-                model_action = int(action_to_send.strip())
-                total_strategy_opportunities += 1
-                if expected_optimal is not None and model_action == expected_optimal:
-                    strategy_followed_count += 1
-                    step_rewards.append(STEP_STRATEGY_REWARD)
+                model_action = int(action_text.strip())
+                ep["strategy_total"] += 1
+                expected = ep.get("_expected_optimal")
+                if expected is not None and model_action == expected:
+                    ep["strategy_count"] += 1
+                    ep["step_rewards"].append(STEP_STRATEGY_REWARD)
                 else:
-                    # Partial credit for legal actions
-                    legal_actions = parse_legal_actions(formatted_observation)
-                    if legal_actions and model_action in legal_actions:
-                        step_rewards.append(STEP_STRATEGY_REWARD * 0.2)
+                    legal = parse_legal_actions(ep["observation"])
+                    if legal and model_action in legal:
+                        ep["step_rewards"].append(STEP_STRATEGY_REWARD * 0.2)
                     else:
-                        step_rewards.append(0.0)
+                        ep["step_rewards"].append(0.0)
             except Exception:
-                total_strategy_opportunities += 1
-                step_rewards.append(0.0)
+                ep["strategy_total"] += 1
+                ep["step_rewards"].append(0.0)
 
-            # --- Step Environment (POST /step) ---
+        # 2d. Step all envs in parallel
+        def step_env(index):
+            ep = episodes[index]
+            if not ep["active"] or ep["done"]:
+                return index
+            action = ep.get("_parsed_action", "")
             try:
-                formatted_observation = ""
-                step_payload = {"action": action_to_send, "episode_id": episode_id}
-                step_res = requests.post(f"{env_endpoint}/step", json=step_payload, timeout=TIMEOUT)
-                step_res.raise_for_status()
-                step_data = step_res.json()
-                step_block = step_data["result"]
-
-                raw_observation = step_block.get("observation", "")
-                formatted_observation = format_observation(raw_observation)
-                step_reward = step_block.get("reward", 0)
-                done = step_block.get("done", False)
-
+                payload = {"action": action, "episode_id": ep["episode_id"]}
+                res = requests.post(f"{ep['env_endpoint']}/step", json=payload, timeout=TIMEOUT)
+                res.raise_for_status()
+                result = res.json()["result"]
+                ep["observation"] = format_observation(result.get("observation", ""))
+                done = result.get("done", False)
+                ep["done"] = done
+                if "Nothing happens" in ep["observation"] or "Invalid" in ep["observation"]:
+                    ep["invalid_count"] += 1
+                if done:
+                    ep["train_reward"] = result.get("reward", 0)
             except Exception as e:
-                print(f"Step failed: {e}")
-                step_reward = -0.01
-                done = False
-                invalid_count += 1
+                print(f"Step failed for episode {index}: {e}")
+                ep["invalid_count"] += 1
+            return index
 
-            # Check for invalid actions in observation
-            if "Nothing happens" in formatted_observation or "Invalid" in formatted_observation:
-                invalid_count += 1
+        step_futures = [thread_pool.submit(step_env, i) for i in active_indices]
+        for f in as_completed(step_futures):
+            f.result()
 
-            if done:
-                train_reward = step_reward
-            # Next observation will be added at the top of the loop with hint
+    # ========================================
+    # Phase 3: Build results
+    # ========================================
+    results = []
+    for i in range(num_episodes):
+        ep = episodes[i]
+        comp_ids = ep["completion_ids"]
+        lps = ep["logprobs"]
+        am = ep["action_mask"]
 
-            turn_number += 1
-
-        # Truncate episode if completion sequence exceeds max length
-        if len(episode_completion_ids) > MAX_EPISODE_TOKENS:
-            print(f"Warning: Episode completion exceeded {MAX_EPISODE_TOKENS} tokens ({len(episode_completion_ids)}), truncating")
-            episode_completion_ids = episode_completion_ids[:MAX_EPISODE_TOKENS]
-            episode_logprobs = episode_logprobs[:MAX_EPISODE_TOKENS]
-            episode_action_mask = episode_action_mask[:MAX_EPISODE_TOKENS]
-
-        # --- Calculate Final Reward with Strategy Shaping ---
-        strategy_ratio = strategy_followed_count / total_strategy_opportunities if total_strategy_opportunities > 0 else 0.0
-
-        immediate_rewards = sum(step_rewards)
-
-        if not done:
-            shaped_reward = immediate_rewards + strategy_ratio
-        else:
-            shaped_reward = (
-                STRATEGY_REWARD_WEIGHT * strategy_ratio +
-                (1 - STRATEGY_REWARD_WEIGHT) * train_reward +
-                immediate_rewards
-            )
-
-        shaped_reward = shaped_reward - 0.05 * float(invalid_count)
-
-        print("============")
-        print(f"id: {game_id}, max_turn: {current_max_turn}, hints: {use_hints}", f"Strategy: {strategy_followed_count}/{total_strategy_opportunities} ({strategy_ratio:.2%})")
-        print("============")
-
-        return index, {
-            "prompt_ids": episode_prompt_ids,
-            "completion_ids": episode_completion_ids,
-            "action_mask": episode_action_mask,
-            "logprobs": episode_logprobs,
-            "reward": shaped_reward,
-            "strategy_ratio": strategy_ratio,
-            "final_score": train_reward,
-        }
-
-    # --- Execute in parallel ---
-    results = [None] * len(prompts)
-    executor = rollout_full_prompt_and_completion_parallelized_curriculum.thread_pool
-
-    futures = [
-        executor.submit(run_single_prompt, i, p)
-        for i, p in enumerate(prompts)
-    ]
-
-    for f in as_completed(futures):
-        idx, res = f.result()
-        if res is not None:
-            results[idx] = res
-        else:
-            results[idx] = {
+        if not comp_ids:
+            results.append({
                 "prompt_ids": [1],
                 "completion_ids": [1],
                 "action_mask": [0],
@@ -1123,23 +1099,63 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
                 "reward": 0.0,
                 "strategy_ratio": 0.0,
                 "final_score": 0.0,
-            }
+            })
+            continue
 
-    # Update curriculum after batch
-    curriculum.step(len(prompts))
+        # Truncate if needed
+        if len(comp_ids) > MAX_EPISODE_TOKENS:
+            comp_ids = comp_ids[:MAX_EPISODE_TOKENS]
+            lps = lps[:MAX_EPISODE_TOKENS]
+            am = am[:MAX_EPISODE_TOKENS]
 
-    list_results = [r for r in results if r is not None]
+        strategy_ratio = ep["strategy_count"] / ep["strategy_total"] if ep["strategy_total"] > 0 else 0.0
+        immediate_rewards = sum(ep["step_rewards"])
 
-    avg_strategy = sum(r["strategy_ratio"] for r in list_results) / len(list_results) if list_results else 0
-    avg_final = sum(r["final_score"] for r in list_results) / len(list_results) if list_results else 0
-    print(f"[BATCH] Avg Strategy Adherence: {avg_strategy:.2%}, Avg Final Score: {avg_final:.3f}")
+        if not ep["done"]:
+            shaped_reward = immediate_rewards + strategy_ratio
+        else:
+            shaped_reward = (
+                STRATEGY_REWARD_WEIGHT * strategy_ratio +
+                (1 - STRATEGY_REWARD_WEIGHT) * ep["train_reward"] +
+                immediate_rewards
+            )
+        shaped_reward -= 0.05 * ep["invalid_count"]
+
+        print(
+            f"============\n"
+            f"id: {ep['game_id']}, max_turn: {current_max_turn}, hints: {ep['use_hints']}, "
+            f"role={'teacher' if ep['is_teacher'] else 'student'}, "
+            f"Strategy: {ep['strategy_count']}/{ep['strategy_total']} ({strategy_ratio:.2%})\n"
+            f"============"
+        )
+
+        results.append({
+            "prompt_ids": ep["prompt_ids_first"],
+            "completion_ids": comp_ids,
+            "action_mask": am,
+            "logprobs": lps,
+            "reward": shaped_reward,
+            "strategy_ratio": strategy_ratio,
+            "final_score": ep["train_reward"],
+        })
+
+    # Update curriculum
+    curriculum.step(num_episodes)
+
+    # Batch stats
+    teachers = [r for i, r in enumerate(results) if episodes[i].get("is_teacher", False)]
+    students = [r for i, r in enumerate(results) if not episodes[i].get("is_teacher", True)]
+    t_strat = sum(r["strategy_ratio"] for r in teachers) / max(len(teachers), 1)
+    s_strat = sum(r["strategy_ratio"] for r in students) / max(len(students), 1)
+    avg_reward = sum(r["reward"] for r in results) / max(len(results), 1)
+    print(f"[BATCH] Teacher: {t_strat:.2%}, Student: {s_strat:.2%}, Avg Reward: {avg_reward:.3f}")
 
     return {
-        "prompt_ids": [r["prompt_ids"] for r in list_results],
-        "completion_ids": [r["completion_ids"] for r in list_results],
-        "action_mask": [r["action_mask"] for r in list_results],
-        "logprobs": [r["logprobs"] for r in list_results],
-        "env_rewards": [r["reward"] for r in list_results],
+        "prompt_ids": [r["prompt_ids"] for r in results],
+        "completion_ids": [r["completion_ids"] for r in results],
+        "action_mask": [r["action_mask"] for r in results],
+        "logprobs": [r["logprobs"] for r in results],
+        "env_rewards": [r["reward"] for r in results],
     }
 
 
