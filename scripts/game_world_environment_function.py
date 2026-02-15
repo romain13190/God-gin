@@ -559,7 +559,7 @@ def rollout_first_prompt_and_completion(prompts: list[str], trainer, max_turns: 
 
 
 # ============================================================
-# Rollout Function 2: Last-turn training with strategy forcing
+# Rollout Function 2: Hybrid strategy forcing + model training
 # ============================================================
 def rollout_last_prompt_and_completion_parallelized_curriculum(
     prompts: list[str],
@@ -567,8 +567,11 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
     max_turns: int = 30,
 ) -> dict[str, list]:
     """
-    Parallelized rollout function for Gin Rummy.
-    Uses strategy forcing for early turns, trains model on one target turn.
+    Hybrid rollout for Gin Rummy with privileged learning.
+    - Strategy forcing on early turns (no model generation, fast)
+    - Model generates on the target training turn
+    - Deterministic hint system: even-indexed episodes get hints (teacher),
+      odd-indexed episodes don't (student). hint_prob controls fade-out.
     """
     # --- Constants ---
     STRATEGY_REWARD = 1.0
@@ -586,9 +589,10 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
     }
 
     selected_game = "gin_rummy"
+    fn = rollout_last_prompt_and_completion_parallelized_curriculum
 
     # --- 1. Static Initialization (Once per Rank) ---
-    if not getattr(rollout_last_prompt_and_completion_parallelized_curriculum, "initialized", False):
+    if not getattr(fn, "initialized", False):
         rank = int(os.environ.get("LOCAL_RANK", "0"))
         raw_urls = os.environ.get("ENVIRONMENT_SERVER_URLS", "")
         server_urls = [u.strip() for u in raw_urls.split(",") if u.strip()]
@@ -597,7 +601,6 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
             raise RuntimeError("ENVIRONMENT_SERVER_URLS is empty")
 
         env_pool = []
-
         for idx, base_url in enumerate(server_urls):
             try:
                 print(f"[INIT] Initializing env on server {idx}: {base_url}")
@@ -609,83 +612,67 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
             except Exception as e:
                 raise RuntimeError(f"Failed to init server {base_url}: {e}")
 
-        rollout_last_prompt_and_completion_parallelized_curriculum.rank = rank
-        rollout_last_prompt_and_completion_parallelized_curriculum.env_pool = env_pool
-        rollout_last_prompt_and_completion_parallelized_curriculum.num_servers = len(env_pool)
-        rollout_last_prompt_and_completion_parallelized_curriculum.initialized = True
-        rollout_last_prompt_and_completion_parallelized_curriculum.thread_pool = ThreadPoolExecutor(max_workers=len(env_pool))
-        rollout_last_prompt_and_completion_parallelized_curriculum.generation_semaphore = Semaphore(1)
-        rollout_last_prompt_and_completion_parallelized_curriculum.games_to_task_id_range = games_to_task_id_range
-        rollout_last_prompt_and_completion_parallelized_curriculum.selected_game = selected_game
+        fn.rank = rank
+        fn.env_pool = env_pool
+        fn.num_servers = len(env_pool)
+        fn.initialized = True
+        fn.thread_pool = ThreadPoolExecutor(max_workers=max(16, len(env_pool)))
+        fn.generation_semaphore = Semaphore(1)
 
-        # Initialize curriculum scheduler
-        rollout_last_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
+        # Curriculum: fast progression to max_turn=30
+        fn.curriculum = CurriculumScheduler(
             initial_max_turn=trainer.args.initial_max_turn,
-            final_max_turn=50,
-            rollouts_per_stage=trainer.args.rollouts_per_stage,
+            final_max_turn=30,
+            rollouts_per_stage=96,
             initial_hint_prob=0.75,
             final_hint_prob=0.0,
-            warmup_rollouts=trainer.args.rollouts_per_stage,
+            warmup_rollouts=96,
         )
-        print(f"[CURRICULUM] Initialized with initial_max_turn={trainer.args.initial_max_turn}, final_max_turn=50, rollouts_per_stage={trainer.args.rollouts_per_stage}, initial_hint_prob=0.75, final_hint_prob=0.0, warmup_rollouts={trainer.args.rollouts_per_stage}")
+        print(f"[CURRICULUM] init max_turn={trainer.args.initial_max_turn}->30, stage=96, hint=0.75->0.0")
 
     # Retrieve static variables
-    rank = rollout_last_prompt_and_completion_parallelized_curriculum.rank
-    env_pool = rollout_last_prompt_and_completion_parallelized_curriculum.env_pool
-    num_servers = rollout_last_prompt_and_completion_parallelized_curriculum.num_servers
-    games_to_task_id_range = rollout_last_prompt_and_completion_parallelized_curriculum.games_to_task_id_range
-    selected_game = rollout_last_prompt_and_completion_parallelized_curriculum.selected_game
-    curriculum = rollout_last_prompt_and_completion_parallelized_curriculum.curriculum
+    rank = fn.rank
+    env_pool = fn.env_pool
+    num_servers = fn.num_servers
+    curriculum = fn.curriculum
 
     tokenizer = trainer.processing_class
     TIMEOUT = 2400
 
     # Get current curriculum parameters
-    total_rollouts = curriculum.total_rollouts
     current_max_turn = curriculum.get_max_turn()
     current_hint_prob = curriculum.get_hint_prob()
-    print(f"[CURRICULUM] Rollout {total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
+    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
 
     def run_single_prompt(index: int, prompt: str):
         game_id = int(prompt)
 
         server_idx = (index + rank) % num_servers
-        server = env_pool[server_idx]
-        env_endpoint = server["base_url"]
+        env_endpoint = env_pool[server_idx]["base_url"]
         done = False
         turn_number = 0
         target_training_turn = current_max_turn - 1
 
-        # Determine if this episode gets hints
-        use_hints = random.random() < current_hint_prob
+        # Deterministic hint: even index = teacher (gets hint based on hint_prob)
+        # odd index = student (never gets hint)
+        is_teacher = (index % 2 == 0)
+        use_hints = is_teacher and (random.random() < current_hint_prob)
 
-        # --- Reset Environment (POST /reset) ---
+        # --- Reset Environment ---
         payload = {"task_id": game_id, "seed": 42, "opponent": "mcts"}
-
         try:
             reset_res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=TIMEOUT)
             reset_res.raise_for_status()
-            reset_data = reset_res.json()
-            result_block = reset_data["result"]
-
+            result_block = reset_res.json()["result"]
             episode_id = result_block.get("episode_id", "")
-
-            raw_observation = result_block.get("observation", "")
-            formatted_observation = format_observation(raw_observation)
-
+            formatted_observation = format_observation(result_block.get("observation", ""))
         except Exception as e:
             print(f"Failed to reset environment (Game {game_id}): {e}")
             return index, None
 
-        # --- Build Conversation History ---
-        system_prompt = GIN_RUMMY_SYSTEM_PROMPT
+        # --- Build Conversation with Strategy Forcing ---
+        messages = [{"role": "system", "content": GIN_RUMMY_SYSTEM_PROMPT}]
 
-        if use_hints:
-            system_prompt += GIN_RUMMY_HINT
-
-        messages = [{"role": "system", "content": system_prompt}]
-
-        # Strategy forcing for turns before target training turn
         while not done and (turn_number < target_training_turn):
             messages.append({"role": "user", "content": formatted_observation})
 
@@ -696,38 +683,30 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
 
             messages.append({"role": "assistant", "content": str(optimal_action)})
 
-            # --- Step Environment (POST /step) ---
             try:
-                formatted_observation = ""
                 step_payload = {"action": str(optimal_action), "episode_id": episode_id}
                 step_res = requests.post(f"{env_endpoint}/step", json=step_payload, timeout=TIMEOUT)
                 step_res.raise_for_status()
-                step_data = step_res.json()
-                step_block = step_data["result"]
-
-                raw_observation = step_block.get("observation", "")
-                formatted_observation = format_observation(raw_observation)
-                step_reward = step_block.get("reward", 0)
+                step_block = step_res.json()["result"]
+                formatted_observation = format_observation(step_block.get("observation", ""))
                 done = step_block.get("done", False)
-
             except Exception as e:
                 print(f"Step failed: {e}")
-                step_reward = -0.01
                 done = False
 
             turn_number += 1
 
         if done:
-            print(
-                f"[GT] Game {game_id} ended during strategy forcing phase at turn {turn_number}. "
-                f"Returning fallback."
-            )
             return index, None
 
-        messages.append({"role": "user", "content": formatted_observation})
-        expected_optimal_action = compute_optimal_action(formatted_observation)
+        # --- Target training turn: model generates ---
+        expected_optimal = compute_optimal_action(formatted_observation)
+        obs_for_model = formatted_observation
+        if use_hints and expected_optimal is not None:
+            obs_for_model += f"\n\n[HINT: The best action here is {expected_optimal}]"
+        messages.append({"role": "user", "content": obs_for_model})
 
-        with rollout_last_prompt_and_completion_parallelized_curriculum.generation_semaphore:
+        with fn.generation_semaphore:
             rollout_out = generate_rollout_completions(
                 trainer, prompts=[messages], as_chat=True
             )[0]
@@ -735,58 +714,45 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         prompt_ids = rollout_out.get("prompt_ids", [])
         completion_ids = rollout_out.get("completion_ids", [])
         logprobs = rollout_out.get("logprobs", [])
-        completion_text = tokenizer.decode(
-            completion_ids, skip_special_tokens=True
-        ).strip()
+        completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
 
-        messages.append({"role": "assistant", "content": completion_text})
-
-        # Parse action from model output
+        # --- Parse action ---
         action_to_send = remove_reasoning_tags(completion_text)
         if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-5]
+            action_to_send = action_to_send[:-4]
         if "Action:" in action_to_send:
             action_to_send = action_to_send.split("Action:")[-1].strip()
+        number_match = re.findall(r'\b(\d+)\b', action_to_send)
+        if number_match:
+            action_to_send = number_match[-1]
 
-        # Check strategy adherence for training turn
+        # --- Evaluate ---
         strategy_followed = False
-        try:
-            model_action = int(action_to_send.strip())
-            if expected_optimal_action is not None:
-                strategy_followed = (model_action == expected_optimal_action)
-        except Exception:
-            pass
-
-        # Check for invalid action
         invalid_action = False
         try:
-            action_id_parsed = int(action_to_send.strip())
+            model_action = int(action_to_send.strip())
             legal_actions = parse_legal_actions(formatted_observation)
-            if legal_actions and action_id_parsed not in legal_actions:
-                print(f"Invalid action: {action_id_parsed} not in legal actions: {legal_actions}")
+            if legal_actions and model_action not in legal_actions:
                 invalid_action = True
+            if expected_optimal is not None:
+                strategy_followed = (model_action == expected_optimal)
         except Exception:
             invalid_action = True
-            print(f"Invalid action: {action_to_send}")
 
+        # --- Compute reward ---
         if invalid_action:
-            print(f"Messages: {messages}")
             reward = INVALID_PENALTY
         elif strategy_followed:
-            response_length = len(completion_ids)
-            prompt_length = len(prompt_ids)
-            len_reward_scale = max(0.2, min(5, prompt_length / response_length))
-            reward = STRATEGY_REWARD * len_reward_scale
+            reward = STRATEGY_REWARD
         else:
-            reward = 0.0
+            # Partial credit for legal but non-optimal actions
+            reward = 0.1 if not invalid_action else 0.0
 
-        print("--------------------------------")
         print(
-            f"[GT] game={game_id} train_turn={target_training_turn} "
-            f"strategy={strategy_followed} "
-            f"reward={reward:.3f} hints={use_hints}"
+            f"[GT] game={game_id} turn={target_training_turn} "
+            f"strat={strategy_followed} reward={reward:.2f} "
+            f"hint={use_hints} role={'teacher' if is_teacher else 'student'}"
         )
-        print("--------------------------------")
 
         return index, {
             "prompt_ids": prompt_ids,
@@ -796,13 +762,11 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
             "strategy_followed": strategy_followed,
         }
 
-    # Execute episodes in parallel
+    # --- Execute in parallel ---
     results = [None] * len(prompts)
-    executor = rollout_last_prompt_and_completion_parallelized_curriculum.thread_pool
+    executor = fn.thread_pool
 
-    futures = [
-        executor.submit(run_single_prompt, i, p) for i, p in enumerate(prompts)
-    ]
+    futures = [executor.submit(run_single_prompt, i, p) for i, p in enumerate(prompts)]
 
     for f in as_completed(futures):
         idx, res = f.result()
@@ -823,10 +787,14 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
     # Log batch stats
     valid = [r for r in results if r is not None]
     if valid:
-        avg_strat = sum(1 for r in valid if r["strategy_followed"]) / len(valid)
+        teachers = [r for i, r in enumerate(valid) if i % 2 == 0]
+        students = [r for i, r in enumerate(valid) if i % 2 == 1]
+        t_strat = sum(1 for r in teachers if r["strategy_followed"]) / max(len(teachers), 1)
+        s_strat = sum(1 for r in students if r["strategy_followed"]) / max(len(students), 1)
         avg_reward = sum(r["reward"] for r in valid) / len(valid)
         print(
-            f"[GT-BATCH] Strategy: {avg_strat:.1%}, Avg Reward: {avg_reward:.3f}"
+            f"[BATCH] Teacher: {t_strat:.0%}, Student: {s_strat:.0%}, "
+            f"Avg Reward: {avg_reward:.3f}"
         )
 
     return {
