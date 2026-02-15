@@ -708,7 +708,10 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    train_ds = Dataset.from_list([{"prompt": str(i)} for i in range(100000)])
+    # Game ID ranges: goofspiel=0-99M, liars_dice=100M-199M, leduc_poker=200M-299M,
+    # gin_rummy=300M-399M, othello=400M-499M, backgammon=500M-599M, hex=600M-699M, clobber=700M-799M
+    GIN_RUMMY_ID_START = 300000000
+    train_ds = Dataset.from_list([{"prompt": str(GIN_RUMMY_ID_START + i)} for i in range(100000)])
     dev_ds = train_ds.select(random.sample(range(len(train_ds)), 10))
 
     log_info(f"world_size: {training_args.world_size}")
