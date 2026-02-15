@@ -985,6 +985,10 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
             # Compute optimal action for this observation
             expected_optimal = compute_optimal_action(formatted_observation)
 
+            if turn_number == 0:
+                print(f"[DEBUG-OBS] game={game_id} turn=0 observation='{formatted_observation[:500]}'")
+                print(f"[DEBUG-OBS] legal_actions={parse_legal_actions(formatted_observation)} expected={expected_optimal}")
+
             # Generate Rollout Completion
             with rollout_full_prompt_and_completion_parallelized_curriculum.generation_semaphore:
                 rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
