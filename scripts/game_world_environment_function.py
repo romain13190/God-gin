@@ -1029,12 +1029,21 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
             messages.append({"role": "assistant", "content": completion_text})
 
             # --- Parse Action ---
-            action_to_send = completion_text
+            action_to_send = remove_reasoning_tags(completion_text)
             if action_to_send.endswith("</s>"):
-                action_to_send = action_to_send[:-5]
+                action_to_send = action_to_send[:-4]
 
             if "Action:" in action_to_send:
                 action_to_send = action_to_send.split("Action:")[-1].strip()
+
+            # Robust number extraction: find last integer in the string
+            number_match = re.findall(r'\b(\d+)\b', action_to_send)
+            if number_match:
+                action_to_send = number_match[-1]
+
+            # DEBUG: log what the model generates vs what we expect
+            if turn_number < 3:
+                print(f"[DEBUG] game={game_id} turn={turn_number} raw='{completion_text[:120]}' parsed='{action_to_send}' expected={expected_optimal} legal={parse_legal_actions(formatted_observation)[:10]}")
 
             # --- Check Strategy Adherence ---
             try:
@@ -1050,6 +1059,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
                 total_strategy_opportunities += 1
                 all_steps_correct = False
                 step_rewards.append(0.0)
+                print(f"[DEBUG-FAIL] game={game_id} turn={turn_number} could not parse int from: '{action_to_send}'")
 
             # --- Step Environment (POST /step) ---
             try:
