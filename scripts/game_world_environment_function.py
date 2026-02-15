@@ -366,7 +366,7 @@ class CurriculumScheduler:
         stage = adjusted_rollouts // self.rollouts_per_stage
 
         current_max_turn = min(
-            self.initial_max_turn + stage,
+            self.initial_max_turn + stage * 2,
             self.final_max_turn
         )
         return current_max_turn
@@ -902,15 +902,19 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         rollout_full_prompt_and_completion_parallelized_curriculum.selected_game = selected_game
 
         # Initialize curriculum scheduler
+        # Target: reach max_turn=30 within ~1h (first third of 3h training)
+        # With 16 rollouts/batch, ~180 batches/h → ~2880 rollouts/h
+        # rollouts_per_stage=96, +2 turns/stage → 14 stages to reach 30
+        # 14 stages × 96 = 1344 rollouts + 96 warmup ≈ 1440 rollouts ≈ 90 batches ≈ 30min
         rollout_full_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
             initial_max_turn=trainer.args.initial_max_turn,
-            final_max_turn=50,
-            rollouts_per_stage=trainer.args.rollouts_per_stage,
+            final_max_turn=30,
+            rollouts_per_stage=96,
             initial_hint_prob=0.75,
             final_hint_prob=0.0,
-            warmup_rollouts=trainer.args.rollouts_per_stage,
+            warmup_rollouts=96,
         )
-        print(f"[CURRICULUM] Initialized with initial_max_turn={trainer.args.initial_max_turn}, final_max_turn=50, rollouts_per_stage={trainer.args.rollouts_per_stage}, initial_hint_prob=0.75, final_hint_prob=0.0, warmup_rollouts={trainer.args.rollouts_per_stage}")
+        print(f"[CURRICULUM] Initialized with initial_max_turn={trainer.args.initial_max_turn}, final_max_turn=30, rollouts_per_stage=96, warmup=96")
 
     # Retrieve static variables
     rank = rollout_full_prompt_and_completion_parallelized_curriculum.rank
@@ -950,7 +954,6 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         strategy_followed_count = 0
         total_strategy_opportunities = 0
         step_rewards = []
-        all_steps_correct = True
         # Determine if this episode gets hints
         use_hints = random.random() < current_hint_prob
 
@@ -984,10 +987,6 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         while not done and (turn_number < current_max_turn):
             # Compute optimal action for this observation
             expected_optimal = compute_optimal_action(formatted_observation)
-
-            if turn_number == 0:
-                print(f"[DEBUG-OBS] game={game_id} turn=0 observation='{formatted_observation[:500]}'")
-                print(f"[DEBUG-OBS] legal_actions={parse_legal_actions(formatted_observation)} expected={expected_optimal}")
 
             # Generate Rollout Completion
             with rollout_full_prompt_and_completion_parallelized_curriculum.generation_semaphore:
@@ -1045,25 +1044,23 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
             if number_match:
                 action_to_send = number_match[-1]
 
-            # DEBUG: log what the model generates vs what we expect
-            if turn_number < 3:
-                print(f"[DEBUG] game={game_id} turn={turn_number} raw='{completion_text[:120]}' parsed='{action_to_send}' expected={expected_optimal} legal={parse_legal_actions(formatted_observation)[:10]}")
-
             # --- Check Strategy Adherence ---
             try:
                 model_action = int(action_to_send.strip())
                 total_strategy_opportunities += 1
-                if expected_optimal is not None and model_action == expected_optimal and all_steps_correct:
+                if expected_optimal is not None and model_action == expected_optimal:
                     strategy_followed_count += 1
                     step_rewards.append(STEP_STRATEGY_REWARD)
                 else:
-                    all_steps_correct = False
-                    step_rewards.append(0.0)
+                    # Partial credit for legal actions
+                    legal_actions = parse_legal_actions(formatted_observation)
+                    if legal_actions and model_action in legal_actions:
+                        step_rewards.append(STEP_STRATEGY_REWARD * 0.2)
+                    else:
+                        step_rewards.append(0.0)
             except Exception:
                 total_strategy_opportunities += 1
-                all_steps_correct = False
                 step_rewards.append(0.0)
-                print(f"[DEBUG-FAIL] game={game_id} turn={turn_number} could not parse int from: '{action_to_send}'")
 
             # --- Step Environment (POST /step) ---
             try:
