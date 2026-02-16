@@ -4,7 +4,6 @@ import random
 import requests
 from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Semaphore
 from trl.experimental.openenv import generate_rollout_completions
 
 
@@ -559,7 +558,7 @@ def rollout_first_prompt_and_completion(prompts: list[str], trainer, max_turns: 
 
 
 # ============================================================
-# Rollout Function 2: Hybrid strategy forcing + model training
+# Rollout Function 2: Lockstep batched single-turn rollout
 # ============================================================
 def rollout_last_prompt_and_completion_parallelized_curriculum(
     prompts: list[str],
@@ -567,14 +566,21 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
     max_turns: int = 30,
 ) -> dict[str, list]:
     """
-    Hybrid rollout for Gin Rummy with privileged learning.
-    - Strategy forcing on early turns (no model generation, fast)
-    - Model generates on the target training turn
-    - Deterministic hint system: even-indexed episodes get hints (teacher),
-      odd-indexed episodes don't (student). hint_prob controls fade-out.
+    Lockstep batched Rollout 2 for Gin Rummy with privileged learning.
+
+    4-phase approach (no Semaphore, single vLLM call):
+      Phase 1: Parallel env resets (ThreadPoolExecutor)
+      Phase 2: Parallel strategy forcing (ThreadPoolExecutor)
+               Each thread plays turns 0..target_turn-1 using compute_optimal_action()
+      Phase 3: Single batched generation for all active episodes
+      Phase 4: Evaluate rewards (optimal=1.0, legal=0.1, invalid=-0.1)
+
+    Teacher/student split: even index = teacher (hint based on hint_prob),
+                           odd index = student (never hint).
     """
     # --- Constants ---
     STRATEGY_REWARD = 1.0
+    LEGAL_REWARD = 0.1
     INVALID_PENALTY = -0.1
 
     games_to_task_id_range = {
@@ -617,7 +623,6 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         fn.num_servers = len(env_pool)
         fn.initialized = True
         fn.thread_pool = ThreadPoolExecutor(max_workers=max(16, len(env_pool)))
-        fn.generation_semaphore = Semaphore(1)
 
         # Curriculum: fast progression to max_turn=30
         fn.curriculum = CurriculumScheduler(
@@ -635,50 +640,81 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
     env_pool = fn.env_pool
     num_servers = fn.num_servers
     curriculum = fn.curriculum
+    thread_pool = fn.thread_pool
 
     tokenizer = trainer.processing_class
     TIMEOUT = 2400
+    num_episodes = len(prompts)
 
     # Get current curriculum parameters
     current_max_turn = curriculum.get_max_turn()
     current_hint_prob = curriculum.get_hint_prob()
+    target_turn = current_max_turn - 1
     print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
 
-    def run_single_prompt(index: int, prompt: str):
-        game_id = int(prompt)
+    # ========================================
+    # Phase 1: Parallel env resets
+    # ========================================
+    episodes = [None] * num_episodes
 
+    def reset_env(index):
+        game_id = int(prompts[index])
         server_idx = (index + rank) % num_servers
         env_endpoint = env_pool[server_idx]["base_url"]
-        done = False
-        turn_number = 0
-        target_training_turn = current_max_turn - 1
-
-        # Deterministic hint: even index = teacher (gets hint based on hint_prob)
-        # odd index = student (never gets hint)
-        is_teacher = (index % 2 == 0)
-        use_hints = is_teacher and (random.random() < current_hint_prob)
-
-        # --- Reset Environment ---
         payload = {"task_id": game_id, "seed": 42, "opponent": "mcts"}
         try:
-            reset_res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=TIMEOUT)
-            reset_res.raise_for_status()
-            result_block = reset_res.json()["result"]
-            episode_id = result_block.get("episode_id", "")
-            formatted_observation = format_observation(result_block.get("observation", ""))
+            res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=TIMEOUT)
+            res.raise_for_status()
+            result = res.json()["result"]
+            return index, {
+                "game_id": game_id,
+                "episode_id": result.get("episode_id", ""),
+                "observation": format_observation(result.get("observation", "")),
+                "env_endpoint": env_endpoint,
+                "failed": False,
+            }
         except Exception as e:
-            print(f"Failed to reset environment (Game {game_id}): {e}")
-            return index, None
+            print(f"Reset failed for game {game_id}: {e}")
+            return index, {
+                "game_id": game_id,
+                "episode_id": "",
+                "observation": "",
+                "env_endpoint": env_endpoint,
+                "failed": True,
+            }
 
-        # --- Build Conversation with Strategy Forcing ---
+    reset_futures = [thread_pool.submit(reset_env, i) for i in range(num_episodes)]
+    for f in as_completed(reset_futures):
+        idx, data = f.result()
+        episodes[idx] = data
+
+    # Set teacher/student hints
+    for i in range(num_episodes):
+        ep = episodes[i]
+        is_teacher = (i % 2 == 0)
+        ep["is_teacher"] = is_teacher
+        ep["use_hints"] = is_teacher and (random.random() < current_hint_prob)
+
+    # ========================================
+    # Phase 2: Parallel strategy forcing
+    # ========================================
+    def force_episode(index):
+        """Play turns 0..target_turn-1 using optimal actions. Returns (index, messages, observation, done)."""
+        ep = episodes[index]
+        if ep["failed"]:
+            return index, None, None, True
+
         messages = [{"role": "system", "content": GIN_RUMMY_SYSTEM_PROMPT}]
+        obs = ep["observation"]
+        episode_id = ep["episode_id"]
+        env_endpoint = ep["env_endpoint"]
+        done = False
 
-        while not done and (turn_number < target_training_turn):
-            messages.append({"role": "user", "content": formatted_observation})
+        for turn in range(target_turn):
+            messages.append({"role": "user", "content": obs})
 
-            optimal_action = compute_optimal_action(formatted_observation)
+            optimal_action = compute_optimal_action(obs)
             if optimal_action is None:
-                target_training_turn = turn_number
                 break
 
             messages.append({"role": "assistant", "content": str(optimal_action)})
@@ -688,50 +724,99 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
                 step_res = requests.post(f"{env_endpoint}/step", json=step_payload, timeout=TIMEOUT)
                 step_res.raise_for_status()
                 step_block = step_res.json()["result"]
-                formatted_observation = format_observation(step_block.get("observation", ""))
+                obs = format_observation(step_block.get("observation", ""))
                 done = step_block.get("done", False)
             except Exception as e:
-                print(f"Step failed: {e}")
-                done = False
+                print(f"Strategy forcing step failed for episode {index}: {e}")
+                done = True
+                break
 
-            turn_number += 1
+            if done:
+                break
 
-        if done:
-            return index, None
+        return index, messages, obs, done
 
-        # --- Target training turn: model generates ---
-        expected_optimal = compute_optimal_action(formatted_observation)
-        obs_for_model = formatted_observation
-        if use_hints and expected_optimal is not None:
+    forcing_results = [None] * num_episodes
+    force_futures = [thread_pool.submit(force_episode, i) for i in range(num_episodes)]
+    for f in as_completed(force_futures):
+        idx, messages, obs, done = f.result()
+        forcing_results[idx] = (messages, obs, done)
+
+    # ========================================
+    # Phase 3: Single batched generation
+    # ========================================
+    # Collect prompts from active (non-done) episodes
+    active_indices = []
+    active_prompts = []
+    active_expected = []
+
+    for i in range(num_episodes):
+        messages, obs, done = forcing_results[i]
+        if done or messages is None:
+            continue
+
+        expected_optimal = compute_optimal_action(obs)
+        obs_for_model = obs
+        if episodes[i]["use_hints"] and expected_optimal is not None:
             obs_for_model += f"\n\n[HINT: The best action here is {expected_optimal}]"
         messages.append({"role": "user", "content": obs_for_model})
 
-        with fn.generation_semaphore:
-            rollout_out = generate_rollout_completions(
-                trainer, prompts=[messages], as_chat=True
-            )[0]
+        active_indices.append(i)
+        active_prompts.append(messages)
+        active_expected.append(expected_optimal)
+        # Store observation for reward evaluation
+        episodes[i]["_final_obs"] = obs
 
-        prompt_ids = rollout_out.get("prompt_ids", [])
-        completion_ids = rollout_out.get("completion_ids", [])
-        logprobs = rollout_out.get("logprobs", [])
+    # Single vLLM call for ALL active episodes
+    gen_outputs = {}
+    if active_prompts:
+        all_outputs = generate_rollout_completions(
+            trainer, prompts=active_prompts, as_chat=True
+        )
+        for j, i in enumerate(active_indices):
+            gen_outputs[i] = (all_outputs[j], active_expected[j])
+
+    # ========================================
+    # Phase 4: Evaluate rewards & build results
+    # ========================================
+    results = [None] * num_episodes
+
+    for i in range(num_episodes):
+        ep = episodes[i]
+
+        if i not in gen_outputs:
+            # Episode ended during forcing or failed reset — fallback
+            results[i] = {
+                "prompt_ids": [1],
+                "completion_ids": [1],
+                "logprobs": [1.0],
+                "reward": 0.0,
+                "strategy_followed": False,
+            }
+            continue
+
+        output, expected_optimal = gen_outputs[i]
+        prompt_ids = output.get("prompt_ids", [])
+        completion_ids = output.get("completion_ids", [])
+        logprobs = output.get("logprobs", [])
         completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
 
-        # --- Parse action ---
-        action_to_send = remove_reasoning_tags(completion_text)
-        if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-4]
-        if "Action:" in action_to_send:
-            action_to_send = action_to_send.split("Action:")[-1].strip()
-        number_match = re.findall(r'\b(\d+)\b', action_to_send)
-        if number_match:
-            action_to_send = number_match[-1]
+        # Parse action
+        action_text = remove_reasoning_tags(completion_text)
+        if action_text.endswith("</s>"):
+            action_text = action_text[:-4]
+        if "Action:" in action_text:
+            action_text = action_text.split("Action:")[-1].strip()
+        numbers = re.findall(r'\b(\d+)\b', action_text)
+        if numbers:
+            action_text = numbers[-1]
 
-        # --- Evaluate ---
+        # Evaluate
         strategy_followed = False
         invalid_action = False
         try:
-            model_action = int(action_to_send.strip())
-            legal_actions = parse_legal_actions(formatted_observation)
+            model_action = int(action_text.strip())
+            legal_actions = parse_legal_actions(ep["_final_obs"])
             if legal_actions and model_action not in legal_actions:
                 invalid_action = True
             if expected_optimal is not None:
@@ -739,22 +824,22 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         except Exception:
             invalid_action = True
 
-        # --- Compute reward ---
+        # Compute reward
         if invalid_action:
             reward = INVALID_PENALTY
         elif strategy_followed:
             reward = STRATEGY_REWARD
         else:
-            # Partial credit for legal but non-optimal actions
-            reward = 0.1 if not invalid_action else 0.0
+            reward = LEGAL_REWARD
 
+        is_teacher = ep["is_teacher"]
         print(
-            f"[GT] game={game_id} turn={target_training_turn} "
+            f"[GT] game={ep['game_id']} turn={target_turn} "
             f"strat={strategy_followed} reward={reward:.2f} "
-            f"hint={use_hints} role={'teacher' if is_teacher else 'student'}"
+            f"hint={ep['use_hints']} role={'teacher' if is_teacher else 'student'}"
         )
 
-        return index, {
+        results[i] = {
             "prompt_ids": prompt_ids,
             "completion_ids": completion_ids,
             "logprobs": logprobs,
@@ -762,40 +847,19 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
             "strategy_followed": strategy_followed,
         }
 
-    # --- Execute in parallel ---
-    results = [None] * len(prompts)
-    executor = fn.thread_pool
-
-    futures = [executor.submit(run_single_prompt, i, p) for i, p in enumerate(prompts)]
-
-    for f in as_completed(futures):
-        idx, res = f.result()
-        if res is not None:
-            results[idx] = res
-        else:
-            results[idx] = {
-                "prompt_ids": [1],
-                "completion_ids": [1],
-                "logprobs": [1.0],
-                "reward": 0.0,
-                "strategy_followed": False,
-            }
-
     # Update curriculum
-    curriculum.step(len(prompts))
+    curriculum.step(num_episodes)
 
     # Log batch stats
-    valid = [r for r in results if r is not None]
-    if valid:
-        teachers = [r for i, r in enumerate(valid) if i % 2 == 0]
-        students = [r for i, r in enumerate(valid) if i % 2 == 1]
-        t_strat = sum(1 for r in teachers if r["strategy_followed"]) / max(len(teachers), 1)
-        s_strat = sum(1 for r in students if r["strategy_followed"]) / max(len(students), 1)
-        avg_reward = sum(r["reward"] for r in valid) / len(valid)
-        print(
-            f"[BATCH] Teacher: {t_strat:.0%}, Student: {s_strat:.0%}, "
-            f"Avg Reward: {avg_reward:.3f}"
-        )
+    teachers = [results[i] for i in range(num_episodes) if episodes[i]["is_teacher"]]
+    students = [results[i] for i in range(num_episodes) if not episodes[i]["is_teacher"]]
+    t_strat = sum(1 for r in teachers if r["strategy_followed"]) / max(len(teachers), 1)
+    s_strat = sum(1 for r in students if r["strategy_followed"]) / max(len(students), 1)
+    avg_reward = sum(r["reward"] for r in results) / max(len(results), 1)
+    print(
+        f"[BATCH] Teacher: {t_strat:.0%}, Student: {s_strat:.0%}, "
+        f"Avg Reward: {avg_reward:.3f}"
+    )
 
     return {
         "prompt_ids": [r["prompt_ids"] for r in results],

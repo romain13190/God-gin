@@ -42,7 +42,7 @@ GRPO_CONFIG = {
         "distributed": "ddp",
         "gpu_count": 2,
         "batch_size": 4,
-        "gradient_accumulation_steps": 4,
+        "gradient_accumulation_steps": 2,
         "vllm_gpu_memory_utilization": 0.3,
         "use_lora": True,
         "beta": 0.01,

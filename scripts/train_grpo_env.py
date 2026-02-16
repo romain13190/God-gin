@@ -844,12 +844,13 @@ def main():
             ],
         )
     else:
-        # Lockstep batched multi-turn rollout with action masking
-        training_args.max_completion_length = 2048
-        print("Training with lockstep batched multi-turn rollout (ActionMaskedGRPOTrainer)")
-        trainer = ActionMaskedGRPOTrainer(
+        # Rollout 2: lockstep batched single-turn rollout (no action masking needed)
+        training_args.max_completion_length = 16
+        training_args.initial_max_turn = 1
+        print("Training with lockstep batched Rollout 2 (GRPOTrainer)")
+        trainer = GRPOTrainer(
             model=model,
-            rollout_func=game_world_rollout_full_prompt_and_completion_parallelized_curriculum,
+            rollout_func=game_world_rollout_last_prompt_and_completion_parallelized_curriculum,
             reward_funcs=[game_world_rollout_reward_func],
             args=training_args,
             train_dataset=train_ds,
