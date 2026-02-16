@@ -64,6 +64,7 @@ class TrainingArguments(GRPOConfig):
     disable_action_mask: Optional[bool] = field(default=False)
     initial_max_turn: Optional[int] = field(default=2)
     rollouts_per_stage: Optional[int] = field(default=1280)
+    end_time: Optional[str] = field(default="")
 
 def print_trainable_parameters(model):
     """
@@ -801,6 +802,7 @@ def main():
         training_args.max_completion_length = 2048
         training_args.vllm_max_model_length += 2048
         training_args.initial_max_turn = 1
+        training_args.end_time = train_request["end_time"]
         trainer = GRPOTrainer(
             model=model,
             rollout_func=game_world_rollout_last_prompt_and_completion_parallelized_curriculum,
@@ -824,6 +826,7 @@ def main():
         print("Training reasoning model with GRPOTrainer")
         training_args.max_completion_length = 16
         training_args.initial_max_turn = 1
+        training_args.end_time = train_request["end_time"]
         trainer = GRPOTrainer(
             model=model,
             rollout_func=game_world_rollout_last_prompt_and_completion_parallelized_curriculum,
@@ -847,6 +850,7 @@ def main():
         # Rollout 2: lockstep batched single-turn rollout (no action masking needed)
         training_args.max_completion_length = 16
         training_args.initial_max_turn = 1
+        training_args.end_time = train_request["end_time"]
         print("Training with lockstep batched Rollout 2 (GRPOTrainer)")
         trainer = GRPOTrainer(
             model=model,

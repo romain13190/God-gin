@@ -2,6 +2,7 @@ import os
 import re
 import random
 import requests
+import datetime
 from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from trl.experimental.openenv import generate_rollout_completions
@@ -336,64 +337,82 @@ def remove_reasoning_tags(text: str) -> str:
 # ============================================================
 class CurriculumScheduler:
     """
-    Manages curriculum learning parameters throughout training.
+    Time-based curriculum scheduler. All progression is tied to wall-clock
+    progress = elapsed / total_duration, derived from end_time.
+
+    - max_turn: ramps 1→30 over first 70% of training, then plateau
+    - strategy_hint: fades 0.75→0.0 over first 80% of training (slow)
+    - action_hint: fades 0.75→0.0 over first 40% of training (fast)
     """
     def __init__(
         self,
+        end_time_str,
         initial_max_turn=1,
-        final_max_turn=50,
-        rollouts_per_stage=1280,
+        final_max_turn=30,
         initial_hint_prob=0.75,
         final_hint_prob=0.0,
-        warmup_rollouts=128,
+        max_turn_ramp_frac=0.7,
+        strategy_hint_fade_frac=0.8,
+        action_hint_fade_frac=0.4,
     ):
         self.initial_max_turn = initial_max_turn
         self.final_max_turn = final_max_turn
-        self.rollouts_per_stage = rollouts_per_stage
         self.initial_hint_prob = initial_hint_prob
         self.final_hint_prob = final_hint_prob
-        self.warmup_rollouts = warmup_rollouts
+        self.max_turn_ramp_frac = max_turn_ramp_frac
+        self.strategy_hint_fade_frac = strategy_hint_fade_frac
+        self.action_hint_fade_frac = action_hint_fade_frac
+
+        self.start_time = datetime.datetime.now(datetime.timezone.utc)
+        self.end_time = datetime.datetime.strptime(end_time_str, "%Y-%m-%d %H:%M:%S")
+        self.end_time = self.end_time.replace(tzinfo=datetime.timezone.utc)
+        self.total_duration = (self.end_time - self.start_time).total_seconds()
 
         self.total_rollouts = 0
 
+    def _get_progress(self):
+        """Get wall-clock progress as fraction 0.0→1.0."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        elapsed = (now - self.start_time).total_seconds()
+        return min(max(elapsed / self.total_duration, 0.0), 1.0)
+
     def get_max_turn(self):
-        """Calculate current max_turn based on curriculum."""
-        if self.total_rollouts < self.warmup_rollouts:
-            return self.initial_max_turn
-
-        adjusted_rollouts = self.total_rollouts - self.warmup_rollouts
-        stage = adjusted_rollouts // self.rollouts_per_stage
-
-        current_max_turn = min(
-            self.initial_max_turn + stage * 2,
-            self.final_max_turn
-        )
-        return current_max_turn
+        """max_turn ramps linearly from initial to final over first max_turn_ramp_frac of training."""
+        progress = self._get_progress()
+        ramp_progress = min(progress / self.max_turn_ramp_frac, 1.0)
+        max_turn = self.initial_max_turn + ramp_progress * (self.final_max_turn - self.initial_max_turn)
+        # Round to nearest odd number to keep turn count consistent
+        max_turn = int(max_turn)
+        if max_turn < self.initial_max_turn:
+            max_turn = self.initial_max_turn
+        return min(max_turn, self.final_max_turn)
 
     def get_hint_prob(self):
-        """Calculate current hint probability based on curriculum."""
-        if self.total_rollouts < self.warmup_rollouts:
-            return self.initial_hint_prob
+        """Strategy hint probability — slow fade over strategy_hint_fade_frac of training."""
+        progress = self._get_progress()
+        fade_progress = min(progress / self.strategy_hint_fade_frac, 1.0)
+        prob = self.initial_hint_prob - fade_progress * (self.initial_hint_prob - self.final_hint_prob)
+        return max(prob, self.final_hint_prob)
 
-        total_stages = self.final_max_turn - self.initial_max_turn
-        total_decay_rollouts = total_stages * self.rollouts_per_stage
-
-        adjusted_rollouts = self.total_rollouts - self.warmup_rollouts
-        progress = min(adjusted_rollouts / total_decay_rollouts, 1.0)
-
-        current_prob = self.initial_hint_prob - progress * (self.initial_hint_prob - self.final_hint_prob)
-        return max(current_prob, self.final_hint_prob)
+    def get_action_hint_prob(self):
+        """Action hint probability — fast fade over action_hint_fade_frac of training."""
+        progress = self._get_progress()
+        fade_progress = min(progress / self.action_hint_fade_frac, 1.0)
+        prob = self.initial_hint_prob - fade_progress * (self.initial_hint_prob - self.final_hint_prob)
+        return max(prob, self.final_hint_prob)
 
     def step(self, num_rollouts=1):
-        """Increment rollout counter."""
+        """Increment rollout counter (kept for logging)."""
         self.total_rollouts += num_rollouts
 
     def get_status(self):
         """Get current curriculum status for logging."""
         return {
             "total_rollouts": self.total_rollouts,
+            "progress": f"{self._get_progress():.1%}",
             "max_turn": self.get_max_turn(),
             "hint_prob": self.get_hint_prob(),
+            "action_hint_prob": self.get_action_hint_prob(),
         }
 
 
@@ -437,7 +456,7 @@ def rollout_first_prompt_and_completion(prompts: list[str], trainer, max_turns: 
 
         try:
             print(f"Initializing environment on rank {rank} at {base_url}...")
-            payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, "opponent": "mcts"}
+            payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, "opponent": "random"}
             create_res = requests.post(f"{base_url}/reset", json=payload, timeout=300)
             create_res.raise_for_status()
             rollout_first_prompt_and_completion.initialized = True
@@ -470,7 +489,7 @@ def rollout_first_prompt_and_completion(prompts: list[str], trainer, max_turns: 
         turn_number = 0
 
         # --- Reset Environment (POST /reset) ---
-        payload = {"task_id": game_id, "seed": 42, "opponent": "mcts"}
+        payload = {"task_id": game_id, "seed": 42, "opponent": "random"}
 
         try:
             reset_res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=TIMEOUT)
@@ -610,7 +629,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         for idx, base_url in enumerate(server_urls):
             try:
                 print(f"[INIT] Initializing env on server {idx}: {base_url}")
-                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, "opponent": "mcts"}
+                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, "opponent": "random"}
                 res = requests.post(f"{base_url}/reset", json=payload, timeout=300)
                 res.raise_for_status()
                 env_pool.append({"base_url": base_url})
@@ -624,16 +643,13 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         fn.initialized = True
         fn.thread_pool = ThreadPoolExecutor(max_workers=max(16, len(env_pool)))
 
-        # Curriculum: fast progression to max_turn=30
+        # Time-based curriculum using end_time
         fn.curriculum = CurriculumScheduler(
+            end_time_str=trainer.args.end_time,
             initial_max_turn=trainer.args.initial_max_turn,
             final_max_turn=30,
-            rollouts_per_stage=96,
-            initial_hint_prob=0.75,
-            final_hint_prob=0.0,
-            warmup_rollouts=96,
         )
-        print(f"[CURRICULUM] init max_turn={trainer.args.initial_max_turn}->30, stage=96, hint=0.75->0.0")
+        print(f"[CURRICULUM] time-based: max_turn={trainer.args.initial_max_turn}->30, end_time={trainer.args.end_time}")
 
     # Retrieve static variables
     rank = fn.rank
@@ -649,8 +665,9 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
     # Get current curriculum parameters
     current_max_turn = curriculum.get_max_turn()
     current_hint_prob = curriculum.get_hint_prob()
+    current_action_hint_prob = curriculum.get_action_hint_prob()
     target_turn = current_max_turn - 1
-    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
+    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, strategy_hint={current_hint_prob:.2f}, action_hint={current_action_hint_prob:.2f}")
 
     # ========================================
     # Phase 1: Parallel env resets
@@ -661,7 +678,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         game_id = int(prompts[index])
         server_idx = (index + rank) % num_servers
         env_endpoint = env_pool[server_idx]["base_url"]
-        payload = {"task_id": game_id, "seed": 42, "opponent": "mcts"}
+        payload = {"task_id": game_id, "seed": 42, "opponent": "random"}
         try:
             res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=TIMEOUT)
             res.raise_for_status()
@@ -688,12 +705,13 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         idx, data = f.result()
         episodes[idx] = data
 
-    # Set teacher/student hints
+    # Set teacher/student hints (two independent rolls)
     for i in range(num_episodes):
         ep = episodes[i]
         is_teacher = (i % 2 == 0)
         ep["is_teacher"] = is_teacher
-        ep["use_hints"] = is_teacher and (random.random() < current_hint_prob)
+        ep["use_strategy_hint"] = is_teacher and (random.random() < current_hint_prob)
+        ep["use_action_hint"] = is_teacher and (random.random() < current_action_hint_prob)
 
     # ========================================
     # Phase 2: Parallel strategy forcing
@@ -704,7 +722,11 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         if ep["failed"]:
             return index, None, None, True
 
-        messages = [{"role": "system", "content": GIN_RUMMY_SYSTEM_PROMPT}]
+        # Strategy hint: append GIN_RUMMY_HINT to system prompt for teachers
+        system_prompt = GIN_RUMMY_SYSTEM_PROMPT
+        if ep["use_strategy_hint"]:
+            system_prompt = GIN_RUMMY_SYSTEM_PROMPT + GIN_RUMMY_HINT
+        messages = [{"role": "system", "content": system_prompt}]
         obs = ep["observation"]
         episode_id = ep["episode_id"]
         env_endpoint = ep["env_endpoint"]
@@ -757,7 +779,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
 
         expected_optimal = compute_optimal_action(obs)
         obs_for_model = obs
-        if episodes[i]["use_hints"] and expected_optimal is not None:
+        if episodes[i]["use_action_hint"] and expected_optimal is not None:
             obs_for_model += f"\n\n[HINT: The best action here is {expected_optimal}]"
         messages.append({"role": "user", "content": obs_for_model})
 
@@ -836,7 +858,8 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         print(
             f"[GT] game={ep['game_id']} turn={target_turn} "
             f"strat={strategy_followed} reward={reward:.2f} "
-            f"hint={ep['use_hints']} role={'teacher' if is_teacher else 'student'}"
+            f"strat_hint={ep['use_strategy_hint']} action_hint={ep['use_action_hint']} "
+            f"role={'teacher' if is_teacher else 'student'}"
         )
 
         results[i] = {
@@ -918,7 +941,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         for idx, base_url in enumerate(server_urls):
             try:
                 print(f"[INIT] Initializing env on server {idx}: {base_url}")
-                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, "opponent": "mcts"}
+                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, "opponent": "random"}
                 res = requests.post(f"{base_url}/reset", json=payload, timeout=300)
                 res.raise_for_status()
                 env_pool.append({"base_url": base_url})
@@ -933,14 +956,11 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         fn.thread_pool = ThreadPoolExecutor(max_workers=max(16, len(env_pool)))
 
         fn.curriculum = CurriculumScheduler(
+            end_time_str=trainer.args.end_time,
             initial_max_turn=trainer.args.initial_max_turn,
             final_max_turn=30,
-            rollouts_per_stage=96,
-            initial_hint_prob=0.75,
-            final_hint_prob=0.0,
-            warmup_rollouts=96,
         )
-        print(f"[CURRICULUM] init max_turn={trainer.args.initial_max_turn}->30, stage=96, hint=0.75->0.0")
+        print(f"[CURRICULUM] time-based: max_turn={trainer.args.initial_max_turn}->30, end_time={trainer.args.end_time}")
 
     # Retrieve static variables
     rank = fn.rank
@@ -967,7 +987,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         game_id = int(prompts[index])
         server_idx = (index + rank) % num_servers
         env_endpoint = env_pool[server_idx]["base_url"]
-        payload = {"task_id": game_id, "seed": 42, "opponent": "mcts"}
+        payload = {"task_id": game_id, "seed": 42, "opponent": "random"}
         try:
             res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=TIMEOUT)
             res.raise_for_status()
