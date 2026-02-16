@@ -337,12 +337,17 @@ def remove_reasoning_tags(text: str) -> str:
 # ============================================================
 class CurriculumScheduler:
     """
-    Time-based curriculum scheduler. All progression is tied to wall-clock
-    progress = elapsed / total_duration, derived from end_time.
+    Adaptive curriculum scheduler for Gin Rummy GRPO training.
 
-    - max_turn: ramps 1→30 over first 70% of training, then plateau
-    - strategy_hint: fades 0.75→0.0 over first 80% of training (slow)
-    - action_hint: fades 0.75→0.0 over first 40% of training (fast)
+    - max_turn: advances when model saturates current level (adaptive)
+    - strategy_hint: fades based on time (0.75→0.0 over 80% of training)
+    - action_hint: fades based on time (0.75→0.0 over 40% of training)
+
+    Adaptive max_turn logic:
+      Track student strategy rate over a rolling window. When student
+      achieves >= saturation_threshold (90%) over the last N batches,
+      advance max_turn by 2. Once final_max_turn is reached and saturated,
+      switch to consolidation mode: random turns between 1 and final_max_turn.
     """
     def __init__(
         self,
@@ -351,15 +356,15 @@ class CurriculumScheduler:
         final_max_turn=30,
         initial_hint_prob=0.75,
         final_hint_prob=0.0,
-        max_turn_ramp_frac=0.7,
         strategy_hint_fade_frac=0.8,
         action_hint_fade_frac=0.4,
+        saturation_window=5,
+        saturation_threshold=0.90,
     ):
         self.initial_max_turn = initial_max_turn
         self.final_max_turn = final_max_turn
         self.initial_hint_prob = initial_hint_prob
         self.final_hint_prob = final_hint_prob
-        self.max_turn_ramp_frac = max_turn_ramp_frac
         self.strategy_hint_fade_frac = strategy_hint_fade_frac
         self.action_hint_fade_frac = action_hint_fade_frac
 
@@ -370,6 +375,13 @@ class CurriculumScheduler:
 
         self.total_rollouts = 0
 
+        # Adaptive max_turn state
+        self.current_max_turn = initial_max_turn
+        self.saturation_window = saturation_window
+        self.saturation_threshold = saturation_threshold
+        self.recent_student_rates = []  # rolling window of student strategy rates
+        self.consolidation_mode = False  # True once final_max_turn is saturated
+
     def _get_progress(self):
         """Get wall-clock progress as fraction 0.0→1.0."""
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -377,15 +389,35 @@ class CurriculumScheduler:
         return min(max(elapsed / self.total_duration, 0.0), 1.0)
 
     def get_max_turn(self):
-        """max_turn ramps linearly from initial to final over first max_turn_ramp_frac of training."""
-        progress = self._get_progress()
-        ramp_progress = min(progress / self.max_turn_ramp_frac, 1.0)
-        max_turn = self.initial_max_turn + ramp_progress * (self.final_max_turn - self.initial_max_turn)
-        # Round to nearest odd number to keep turn count consistent
-        max_turn = int(max_turn)
-        if max_turn < self.initial_max_turn:
-            max_turn = self.initial_max_turn
-        return min(max_turn, self.final_max_turn)
+        """Return current max_turn. In consolidation mode, returns random turn between 1 and final_max_turn."""
+        if self.consolidation_mode:
+            return random.randint(1, self.final_max_turn)
+        return self.current_max_turn
+
+    def report_batch(self, student_strategy_rate):
+        """Report student strategy rate for this batch. Advances max_turn if saturated."""
+        if self.consolidation_mode:
+            return  # no more advancing needed
+
+        self.recent_student_rates.append(student_strategy_rate)
+        # Keep only the last saturation_window entries
+        if len(self.recent_student_rates) > self.saturation_window:
+            self.recent_student_rates = self.recent_student_rates[-self.saturation_window:]
+
+        # Check saturation: need full window and all above threshold
+        if len(self.recent_student_rates) >= self.saturation_window:
+            avg_rate = sum(self.recent_student_rates) / len(self.recent_student_rates)
+            if avg_rate >= self.saturation_threshold:
+                old_turn = self.current_max_turn
+                self.current_max_turn = min(self.current_max_turn + 2, self.final_max_turn)
+                if self.current_max_turn != old_turn:
+                    print(f"[CURRICULUM] ADVANCE: max_turn {old_turn} -> {self.current_max_turn} "
+                          f"(student avg {avg_rate:.1%} >= {self.saturation_threshold:.0%} over {self.saturation_window} batches)")
+                    self.recent_student_rates.clear()  # reset window after advancing
+                elif self.current_max_turn == self.final_max_turn:
+                    # Already at final_max_turn and saturated — enter consolidation
+                    self.consolidation_mode = True
+                    print(f"[CURRICULUM] CONSOLIDATION MODE: max_turn=30 saturated, now sampling random turns 1-{self.final_max_turn}")
 
     def get_hint_prob(self):
         """Strategy hint probability — slow fade over strategy_hint_fade_frac of training."""
@@ -649,7 +681,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
             initial_max_turn=trainer.args.initial_max_turn,
             final_max_turn=30,
         )
-        print(f"[CURRICULUM] time-based: max_turn={trainer.args.initial_max_turn}->30, end_time={trainer.args.end_time}")
+        print(f"[CURRICULUM] adaptive: max_turn={trainer.args.initial_max_turn}->30, advances when student saturates >=90% over 5 batches")
 
     # Retrieve static variables
     rank = fn.rank
@@ -667,7 +699,8 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
     current_hint_prob = curriculum.get_hint_prob()
     current_action_hint_prob = curriculum.get_action_hint_prob()
     target_turn = current_max_turn - 1
-    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, strategy_hint={current_hint_prob:.2f}, action_hint={current_action_hint_prob:.2f}")
+    mode_str = "CONSOLIDATION" if curriculum.consolidation_mode else "CLIMBING"
+    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, strategy_hint={current_hint_prob:.2f}, action_hint={current_action_hint_prob:.2f}, mode={mode_str}")
 
     # ========================================
     # Phase 1: Parallel env resets
@@ -883,6 +916,9 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         f"[BATCH] Teacher: {t_strat:.0%}, Student: {s_strat:.0%}, "
         f"Avg Reward: {avg_reward:.3f}"
     )
+
+    # Report student rate for adaptive curriculum (advances max_turn when saturated)
+    curriculum.report_batch(s_strat)
 
     return {
         "prompt_ids": [r["prompt_ids"] for r in results],
